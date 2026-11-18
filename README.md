@@ -2,27 +2,23 @@
 
 Интерактивный менеджер Homebrew в терминале: просмотр, поиск, установка, удаление и обновление пакетов, сервисы, репозитории (tap) и доверие к ним, закрепление версий (pin), резервная копия Brewfile, очистка и диагностика. Совместим с bash 3.2 (macOS) и bash 4/5 (Linux).
 
-## Установка на новый компьютер
+## Установка
 
-Репозиторий приватный, поэтому нужна утилита gh с входом в GitHub:
-
-```
-brew install gh
-```
+Скачать и установить brewman как команду `brewman` (в `~/.local/bin`):
 
 ```
-gh auth login
+curl -fsSL https://raw.githubusercontent.com/aa9010x-prog/brewman/main/brewman.sh -o /tmp/brewman.sh && bash /tmp/brewman.sh --install
 ```
 
-Скачать и установить brewman как команду:
+Установщик спросит разрешение добавить `~/.local/bin` в PATH. После установки откройте новое окно терминала и запустите:
 
 ```
-gh api -H "Accept: application/vnd.github.raw" "repos/aa9010x-prog/brewman/contents/brewman.sh?ref=main" > /tmp/brewman.sh && bash /tmp/brewman.sh --install
+brewman
 ```
 
 ## Обновление
 
-brewman раз в сутки при запуске сам проверяет новую версию и предлагает обновиться. Вручную:
+brewman раз в сутки при запуске сам проверяет новую версию, показывает список изменений и предлагает обновиться. Вручную – пункт 13 главного меню или команда:
 
 ```
 brewman --update
@@ -33,6 +29,8 @@ brewman --update
 ```
 brewman --rollback
 ```
+
+Отключить проверку при запуске – пункт 13 главного меню или переменная окружения `BREWMAN_NO_UPDATE_CHECK=1`.
 
 ## Выпуск новой версии
 

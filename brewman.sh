@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -1404,7 +1404,7 @@ toggle_fzf() {
 #  Самоустановка и справка
 # ══════════════════════════════════════════════════
 # ══════════════════════════════════════════════════
-#  13. Обновление самого brewman из приватного репозитория GitHub
+#  13. Обновление самого brewman из репозитория GitHub
 # ══════════════════════════════════════════════════
 
 # Запуск команды с ограничением по времени (в macOS нет утилиты timeout).
@@ -1447,9 +1447,13 @@ update_token() {
   return 1
 }
 
-# Способ доступа к репозиторию: gh | token | none
+raw_url() { echo "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/$1"; }
+
+# Способ доступа к репозиторию: public (без входа) | gh | token | none
 update_access() {
-  if command -v gh >/dev/null 2>&1 && with_timeout 10 gh auth status >/dev/null 2>&1; then
+  if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 -o /dev/null "$(raw_url VERSION)" 2>/dev/null; then
+    echo "public"
+  elif command -v gh >/dev/null 2>&1 && with_timeout 10 gh auth status >/dev/null 2>&1; then
     echo "gh"
   elif update_token >/dev/null 2>&1; then
     echo "token"
@@ -1460,6 +1464,7 @@ update_access() {
 
 access_label() {
   case "$1" in
+    public) echo "публичный репозиторий, вход не нужен" ;;
     gh) echo "утилита gh" ;;
     token) echo "токен доступа" ;;
     *) echo "не настроен" ;;
@@ -1470,6 +1475,8 @@ access_label() {
 remote_get() {
   local path="$1" tok
   case "$UPDATE_METHOD" in
+    public)
+      curl -fsSL --max-time 60 "$(raw_url "$path")" ;;
     gh)
       gh api -H "Accept: application/vnd.github.raw" "repos/$UPDATE_REPO/contents/$path?ref=$UPDATE_BRANCH" ;;
     token)
@@ -1491,7 +1498,7 @@ update_check() {
   date +%s > "$DATA_DIR/last_check" 2>/dev/null
   UPDATE_METHOD=$(update_access)
   if [ "$UPDATE_METHOD" = "none" ]; then
-    [ "$quiet" -eq 1 ] || warn "Доступ к репозиторию $UPDATE_REPO не настроен."
+    [ "$quiet" -eq 1 ] || warn "Нет доступа к $UPDATE_REPO: нет сети, репозиторий ещё не опубликован или он приватный (тогда настройте доступ – пункт 13 ➡️ 6)."
     return 2
   fi
   tmp=$(mktemp "${TMPDIR:-/tmp}/brewman.XXXXXX")
@@ -1613,7 +1620,7 @@ update_access_setup() {
   local m
   echo ""
   section "${I_LOCK}Доступ к репозиторию $UPDATE_REPO"
-  info "Репозиторий приватный, поэтому для скачивания обновлений нужен вход в GitHub."
+  info "Нужно только если репозиторий приватный: публичный brewman скачивает без входа в GitHub."
   mitem "1) Через утилиту gh – официальный клиент GitHub (рекомендуется)"
   mitem "2) Через токен доступа с правом только на чтение этого репозитория"
   mitem "0) ${I_BACK}Назад"
@@ -1695,11 +1702,7 @@ auto_update_check() {
       fi ;;
     1) ok "Установлена последняя версия ($VERSION)." ;;
     *)
-      if [ "$UPDATE_METHOD" = "none" ]; then
-        info "Проверка обновлений не настроена – пункт 13 главного меню."
-      else
-        info "Проверить обновления не удалось – попробую завтра."
-      fi ;;
+      info "Проверить обновления не удалось (нет сети или доступа к GitHub) – попробую завтра." ;;
   esac
   echo ""
 }
@@ -1712,7 +1715,7 @@ selfupdate_menu() {
     echo ""
     section "${I_UPD}Обновление brewman"
     echo "   Установленная версия: $VERSION"
-    echo "   Репозиторий: $UPDATE_REPO (приватный)"
+    echo "   Репозиторий: https://github.com/$UPDATE_REPO"
     echo "   Последняя проверка: $( [ -n "$last" ] && fmt_epoch "$last" || echo "ещё не было")"
     echo "$LINE1"
     mitem "1) Проверить наличие новой версии"
@@ -1720,7 +1723,7 @@ selfupdate_menu() {
     mitem "3) Откатиться на предыдущую версию"
     mitem "4) Журнал изменений"
     mitem "5) Автопроверка при запуске (раз в сутки): $ac"
-    mitem "6) Настроить доступ к GitHub"
+    mitem "6) Настроить доступ к GitHub (только для приватного репозитория)"
     mitem "0) ${I_BACK}Назад"
     echo "$LINE1"
     ask "Пункт: " || return
@@ -1751,7 +1754,7 @@ selfupdate_menu() {
       4)
         UPDATE_METHOD=$(update_access)
         if [ "$UPDATE_METHOD" = "none" ]; then
-          warn "Доступ к репозиторию не настроен – пункт 6."
+          warn "Нет доступа к репозиторию: нет сети или он приватный (тогда – пункт 6)."
         else
           echo "${I_WAIT}Загружаю журнал..."
           with_timeout 20 remote_get CHANGELOG.md 2>/dev/null | sed 's/^/   /' || err "Не удалось загрузить журнал."
