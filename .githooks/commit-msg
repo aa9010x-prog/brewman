@@ -1,0 +1,18 @@
+#!/bin/sh
+# Удаляет из описания коммита подписи и служебные отметки ИИ-помощников.
+# Включение в копии репозитория: git config core.hooksPath .githooks
+
+msg_file="$1"
+tmp="$msg_file.clean"
+
+grep -v -i -E '^(Co-Authored-By|Claude-Session|Generated-By|Signed-off-by: *Claude)[[:space:]]*:?|claude\.ai/code/session_|Generated with \[?Claude' "$msg_file" > "$tmp"
+
+# Убрать пустые строки в конце
+sed -e ':a' -e '/^[[:space:]]*$/{$d;N;ba' -e '}' "$tmp" > "$msg_file"
+rm -f "$tmp"
+
+if [ ! -s "$msg_file" ]; then
+  echo "commit-msg: описание коммита пустое после очистки – коммит отменён." >&2
+  exit 1
+fi
+exit 0
