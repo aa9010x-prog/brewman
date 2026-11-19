@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.6.2"
+VERSION="1.6.3"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -68,7 +68,7 @@ I_SAVE=$(icon "💾"); I_CLEAN=$(icon "🧹"); I_MODE=$(icon "🔀"); I_EXIT=$(i
 I_BACK=$(icon "↩️"); I_LOCK=$(icon "🔒")
 
 # === Глобальное состояние ===
-USE_FZF=0; IS_MAC=0; DIRTY=1; GREEDY=0; INDEX_UPDATED=0; INDEX_STALE=0
+USE_FZF=0; IS_MAC=0; DIRTY=1; GREEDY=0; INDEX_UPDATED=0; INDEX_STALE=0; BREW_INTERRUPTED=0
 CLEAR=1; [ -n "${BREWMAN_NO_CLEAR:-}" ] && CLEAR=0
 BREW_VER=""; CNT_F=0; CNT_C=0
 LIST=(); LIST_DESC=(); TYPES=(); SEL=(); SEL_IDX=(); ITEMS=()
@@ -78,13 +78,37 @@ UPDATE_METHOD=""; REMOTE_VERSION=""
 LINE2="══════════════════════════════════════════════════"
 LINE1="──────────────────────────────────────────────────"
 
-# Ctrl+C прерывает текущую команду brew, но не всё приложение
-trap 'echo ""; echo "${I_STOP}Прервано (Ctrl+C)."' INT
+# Ctrl+C во время команды brew прерывает только её; на вопросе или в меню – закрывает brewman.
+# Во время ввода перехват снимается: в bash 3.2 (macOS) перехваченный Ctrl+C
+# срабатывает только после нажатия Enter, поэтому там действует стандартное поведение.
+PROMPT_ACTIVE=0
+op_int_trap() { trap 'echo ""; echo "${I_STOP}Прервано (Ctrl+C)."' INT; }
+op_int_trap
+
+# Чтение строки с терминала: $1 – имя переменной
+prompt_read() {
+  local _rc
+  PROMPT_ACTIVE=1
+  trap - INT
+  IFS= read -r "$1"
+  _rc=$?
+  op_int_trap
+  PROMPT_ACTIVE=0
+  return "$_rc"
+}
 
 # Временная папка сеанса: список пакетов, которым пользователь отказал в доверии
 SESSION_DIR=$(mktemp -d "${TMPDIR:-/tmp}/brewman.XXXXXX")
 : > "$SESSION_DIR/declined"
-trap 'rm -rf "$SESSION_DIR"' EXIT
+on_exit() {
+  rm -rf "$SESSION_DIR"
+  if [ "$PROMPT_ACTIVE" -eq 1 ]; then
+    echo ""
+    echo "${I_STOP}Выход по Ctrl+C."
+    echo ""
+  fi
+}
+trap 'on_exit' EXIT
 
 # ══════════════════════════════════════════════════
 #  Вспомогательные функции вывода и ввода
@@ -102,7 +126,7 @@ mitem()   { echo "  $1"; }
 # Ввод строки: результат в ANSWER, код возврата read в ASK_RC
 ask() {
   printf "%s%s" "$I_PTR" "$1"
-  IFS= read -r ANSWER
+  prompt_read ANSWER
   ASK_RC=$?
   [ "$ASK_RC" -ne 0 ] && { echo ""; ANSWER=""; return "$ASK_RC"; }
   ANSWER=$(printf '%s' "$ANSWER" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -113,7 +137,7 @@ ask() {
 confirm() {
   local a
   printf "%s%s [y/N]: " "${2:-$I_Q}" "$1"
-  IFS= read -r a || { echo ""; return 1; }
+  prompt_read a || { echo ""; return 1; }
   case "$a" in
     [yYдД]*) return 0 ;;
     *) return 1 ;;
@@ -124,7 +148,7 @@ confirm_danger() { confirm "$1" "$I_WARN"; }
 pause() {
   echo ""
   printf "%sEnter – продолжить..." "$I_PTR"
-  IFS= read -r _dummy
+  prompt_read _dummy
   echo ""
 }
 
@@ -277,6 +301,12 @@ run_brew() {
   while :; do
     echo "${C_D}\$ brew $*${C_0}"
     { brew "$@" 2>&1 1>&3 3>&- | tee "$errf" 1>&2; rc=${PIPESTATUS[0]}; } 3>&1
+    # Код 128+N – команда остановлена сигналом (Ctrl+C): это не ошибка, повторять и разбирать нечего
+    if [ "$rc" -ge 128 ]; then
+      BREW_INTERRUPTED=1
+      break
+    fi
+    BREW_INTERRUPTED=0
     if [ "$rc" -ne 0 ] && is_trust_error "$errf" && [ "$tries" -lt 10 ]; then
       tries=$((tries+1))
       if trust_offer "$(cat "$errf")"; then
@@ -296,7 +326,7 @@ run_brew() {
     fi
     break
   done
-  if [ "$rc" -ne 0 ] && grep -q 'Full Disk Access' "$errf" 2>/dev/null; then
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 128 ] && grep -q 'Full Disk Access' "$errf" 2>/dev/null; then
     fda_offer "$*"
   fi
   if [ "$rc" -ne 0 ] && grep -q 'not trusted' "$errf" 2>/dev/null; then
@@ -656,6 +686,13 @@ batch_run() {
     if run_brew $action $flags "$name"; then
       ok "$name: успешно."
       ok_list="$ok_list $name"; n_ok=$((n_ok+1))
+    elif [ "$BREW_INTERRUPTED" -eq 1 ]; then
+      stopped "$name: прервано (Ctrl+C)."
+      fail_list="$fail_list $name"; n_fail=$((n_fail+1))
+      echo "▲────────────────────────▲"
+      echo ""
+      warn "Остальные пакеты пропущены."
+      break
     else
       err "$name: ошибка."
       fail_list="$fail_list $name"; n_fail=$((n_fail+1))
@@ -935,7 +972,13 @@ diagnose_update_failure() {
 
 update_index() {
   echo "${I_WAIT}Обновляю индекс пакетов Homebrew..."
-  if run_brew update || diagnose_update_failure; then
+  if run_brew update; then
+    ok "Индекс обновлён."
+    INDEX_UPDATED=1; INDEX_STALE=0
+  elif [ "$BREW_INTERRUPTED" -eq 1 ]; then
+    stopped "Обновление индекса прервано."
+    INDEX_STALE=1
+  elif diagnose_update_failure; then
     ok "Индекс обновлён."
     INDEX_UPDATED=1; INDEX_STALE=0
   else
@@ -2040,7 +2083,7 @@ main_loop() {
     mitem "13) ${I_UPD}Обновление brewman"
     mitem " 0) ${I_EXIT}Выход"
     echo "$LINE1"
-    if ! ask "Пункт меню: "; then
+    if ! ask "Пункт меню (0 или Ctrl+C – выход): "; then
       [ "$ASK_RC" -eq 1 ] && quit
       continue
     fi
