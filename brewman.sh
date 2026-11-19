@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -68,7 +68,7 @@ I_SAVE=$(icon "💾"); I_CLEAN=$(icon "🧹"); I_MODE=$(icon "🔀"); I_EXIT=$(i
 I_BACK=$(icon "↩️"); I_LOCK=$(icon "🔒")
 
 # === Глобальное состояние ===
-USE_FZF=0; IS_MAC=0; DIRTY=1; GREEDY=0; INDEX_UPDATED=0
+USE_FZF=0; IS_MAC=0; DIRTY=1; GREEDY=0; INDEX_UPDATED=0; INDEX_STALE=0
 CLEAR=1; [ -n "${BREWMAN_NO_CLEAR:-}" ] && CLEAR=0
 BREW_VER=""; CNT_F=0; CNT_C=0
 LIST=(); LIST_DESC=(); TYPES=(); SEL=(); SEL_IDX=(); ITEMS=()
@@ -302,6 +302,8 @@ run_brew() {
   if [ "$rc" -ne 0 ] && grep -q 'not trusted' "$errf" 2>/dev/null; then
     info "Есть непроверенные репозитории – доверием можно управлять в пункте 9 главного меню."
   fi
+  # Последние ошибки сохраняются для разбора причин (например, при сбое brew update)
+  cp "$errf" "$SESSION_DIR/last_err" 2>/dev/null
   rm -f "$errf"
   return "$rc"
 }
@@ -872,13 +874,73 @@ uninstall_menu() {
 # ══════════════════════════════════════════════════
 #  5. Обновления
 # ══════════════════════════════════════════════════
+# Дата последнего обновления кэша API Homebrew (данных о версиях пакетов)
+api_cache_date() {
+  local d f t
+  d="$(brew --cache 2>/dev/null)/api"
+  [ -d "$d" ] || return 1
+  f=$(find "$d" -type f -name '*.json' 2>/dev/null | while IFS= read -r x; do
+        t=$(stat -f %m "$x" 2>/dev/null || stat -c %Y "$x" 2>/dev/null)
+        echo "$t $x"
+      done | sort -rn | head -1)
+  t=${f%% *}
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  fmt_epoch "$t"
+}
+
+# Предупреждение, если индекс в этом сеансе не обновился
+stale_warning() {
+  local d
+  [ "$INDEX_STALE" -eq 1 ] || return 0
+  d=$(api_cache_date)
+  warn "Индекс не обновился – список ниже построен по сохранённым данным${d:+ от $d} и может быть неполным."
+}
+
+# Разбор ошибки brew update: проверка сервера, очистка кэша, повтор.
+# Код 0 – индекс в итоге обновлён.
+diagnose_update_failure() {
+  local url host code
+  url=$(grep -o 'https://[^ !]*' "$SESSION_DIR/last_err" 2>/dev/null | head -1)
+  echo ""
+  section "${I_SEARCH}Почему не обновился индекс"
+  if [ -z "$url" ] || ! command -v curl >/dev/null 2>&1; then
+    info "Возможные причины: нет сети, мешает VPN или прокси, временный сбой на стороне Homebrew."
+    if confirm "Повторить brew update?"; then run_brew update && return 0; fi
+    return 1
+  fi
+  host=${url#https://}; host=${host%%/*}
+  echo "${I_WAIT}Проверяю доступность $host..."
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)
+  case "$code" in
+    200)
+      info "Файл на сервере есть и скачивается – скорее всего, повреждён сохранённый кэш данных Homebrew (папка $(brew --cache)/api)."
+      info "Очистка безопасна: кэш просто скачается заново."
+      if confirm "Очистить кэш и повторить brew update?"; then
+        rm -rf "$(brew --cache)/api" && ok "Кэш очищен."
+        run_brew update && return 0
+        warn "Не помогло. Вероятно, сбой на стороне Homebrew – повторите позже."
+      fi ;;
+    000|"")
+      info "Сервер $host недоступен с этого компьютера: нет сети, мешает VPN или прокси, либо сервер не отвечает."
+      info "Попробуйте включить или выключить VPN."
+      if confirm "Повторить brew update?"; then run_brew update && return 0; fi ;;
+    404|5??)
+      info "Сервер ответил кодом $code – похоже на сбой на стороне Homebrew. Обычно его исправляют в течение нескольких часов; повторите позже." ;;
+    *)
+      info "Сервер ответил кодом $code."
+      if confirm "Повторить brew update?"; then run_brew update && return 0; fi ;;
+  esac
+  return 1
+}
+
 update_index() {
   echo "${I_WAIT}Обновляю индекс пакетов Homebrew..."
-  if run_brew update; then
+  if run_brew update || diagnose_update_failure; then
     ok "Индекс обновлён."
-    INDEX_UPDATED=1
+    INDEX_UPDATED=1; INDEX_STALE=0
   else
-    err "Не удалось обновить индекс. Проверьте подключение к интернету."
+    err "Индекс не обновлён."
+    INDEX_STALE=1
   fi
   echo ""
 }
@@ -910,11 +972,13 @@ updates_menu() {
         maybe_update_index
         echo "${I_WAIT}Проверяю устаревшие пакеты..."
         load_outdated
+        stale_warning
         if [ ${#LIST[@]} -eq 0 ]; then ok "Все пакеты актуальны."; else print_list; fi ;;
       3)
         maybe_update_index
         echo "${I_WAIT}Проверяю устаревшие пакеты..."
         load_outdated
+        stale_warning
         if [ ${#LIST[@]} -eq 0 ]; then
           ok "Все пакеты актуальны."
         else
@@ -932,6 +996,7 @@ updates_menu() {
         maybe_update_index
         echo "${I_WAIT}Проверяю устаревшие пакеты..."
         load_outdated
+        stale_warning
         if [ ${#LIST[@]} -eq 0 ]; then
           ok "Все пакеты актуальны."
         else
