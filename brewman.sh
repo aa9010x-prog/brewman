@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.7.0"
+VERSION="1.7.1"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -1591,6 +1591,7 @@ app_version() {
 # Результат: LIST (cask), LIST_DESC, TYPES, ADOPT_PATH (путь), ADOPT_MATCH (1 – версия совпадает)
 load_adoptable() {
   local d app base installed best best_ver best_score score cver aver status n_mas=0 n_managed=0 n_none=0 t v dep
+  local all alts x
   reset_lists; ADOPT_PATH=(); ADOPT_MATCH=()
   installed=" $(caskroom_list 2>/dev/null | awk '{print $1}' | tr '\n' ' ') "
   for d in $APP_DIRS; do
@@ -1598,12 +1599,13 @@ load_adoptable() {
     while IFS= read -r app; do
       [ -n "$app" ] || continue
       base=${app##*/}
-      best=""; best_ver=""; best_score=0
+      best=""; best_ver=""; best_score=0; all=""
       # Все cask, которые ставят приложение с таким именем. Выбор: не устаревший,
       # без «@» (не бета и не особая сборка), с самым коротким именем.
       while IFS="$(printf '\t')" read -r t _ v dep; do
         [ -n "$t" ] || continue
         case "$installed" in *" $t "*) best="__managed__"; break ;; esac
+        all="$all|$t (${v%%,*})"
         score=$(( ${#t} ))
         [ "$dep" = "1" ] && score=$((score + 1000))
         case "$t" in *@*) score=$((score + 500)) ;; esac
@@ -1623,8 +1625,17 @@ load_adoptable() {
       else
         status="в Homebrew – $cver"; ADOPT_MATCH+=("0")
       fi
+      # Остальные пакеты для этой же программы – справочно
+      alts=""
+      while IFS= read -r x; do
+        [ -n "$x" ] || continue
+        [ "${x%% (*}" = "$best" ] && continue
+        alts="${alts:+$alts, }$x"
+      done <<EOF_ALTS
+$(printf '%s' "$all" | tr '|' '\n')
+EOF_ALTS
       LIST+=("$best"); TYPES+=("cask"); ADOPT_PATH+=("$app")
-      LIST_DESC+=("$base  установлена ${aver:-?} · $status")
+      LIST_DESC+=("$base  установлена ${aver:-?} · $status${alts:+ · другие пакеты: $alts}")
     done < <(find "$d" -maxdepth 2 -name '*.app' -type d -prune 2>/dev/null | sort)
   done
   ADOPT_STATS="уже под управлением Homebrew: $n_managed, из App Store: $n_mas, нет в Homebrew: $n_none"
@@ -1651,6 +1662,7 @@ adopt_menu() {
   ok "Можно передать под управление: ${#LIST[@]} (с совпадающей версией: $n_match)."
   info "Пропущено – $ADOPT_STATS. Программы из App Store обновляет App Store."
   info "Если версии различаются, Homebrew может отказаться брать программу – тогда brewman предложит заменить её версией из Homebrew."
+  info "«Другие пакеты» – альтернативные сборки той же программы (бета, ESR и т.п.), показаны справочно. Поставить такую сборку можно через пункт 3 главного меню."
   echo ""
   PICK_PREVIEW="--cask"
   pick "Передать под управление" 1 || { pause; return; }
