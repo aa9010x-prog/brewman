@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.6.3"
+VERSION="1.6.4"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -1555,12 +1555,19 @@ update_token() {
   return 1
 }
 
-raw_url() { echo "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/$1"; }
+# Адреса файлов публичного репозитория:
+# api_url – через API GitHub, всегда свежие данные (ограничение – 60 запросов в час на адрес);
+# raw_url – через сервер raw.githubusercontent.com, кэширует файлы до 5 минут, поэтому
+# к адресу добавляется метка времени, чтобы получить свежую копию.
+api_url() { echo "https://api.github.com/repos/$UPDATE_REPO/contents/$1?ref=$UPDATE_BRANCH"; }
+raw_url() { echo "https://raw.githubusercontent.com/$UPDATE_REPO/$UPDATE_BRANCH/$1?t=$(date +%s)"; }
 
-# Способ доступа к репозиторию: public (без входа) | gh | token | none
+# Способ доступа к репозиторию: public (API, без входа) | raw (без входа) | gh | token | none
 update_access() {
-  if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 -o /dev/null "$(raw_url VERSION)" 2>/dev/null; then
+  if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 -o /dev/null -H "Accept: application/vnd.github.raw" "$(api_url VERSION)" 2>/dev/null; then
     echo "public"
+  elif command -v curl >/dev/null 2>&1 && curl -fsS --max-time 10 -o /dev/null "$(raw_url VERSION)" 2>/dev/null; then
+    echo "raw"
   elif command -v gh >/dev/null 2>&1 && with_timeout 10 gh auth status >/dev/null 2>&1; then
     echo "gh"
   elif update_token >/dev/null 2>&1; then
@@ -1572,7 +1579,8 @@ update_access() {
 
 access_label() {
   case "$1" in
-    public) echo "публичный репозиторий, вход не нужен" ;;
+    public) echo "публичный репозиторий через API GitHub, вход не нужен" ;;
+    raw) echo "публичный репозиторий через raw.githubusercontent.com, вход не нужен" ;;
     gh) echo "утилита gh" ;;
     token) echo "токен доступа" ;;
     *) echo "не настроен" ;;
@@ -1584,6 +1592,8 @@ remote_get() {
   local path="$1" tok
   case "$UPDATE_METHOD" in
     public)
+      curl -fsSL --max-time 60 -H "Accept: application/vnd.github.raw" "$(api_url "$path")" ;;
+    raw)
       curl -fsSL --max-time 60 "$(raw_url "$path")" ;;
     gh)
       gh api -H "Accept: application/vnd.github.raw" "repos/$UPDATE_REPO/contents/$path?ref=$UPDATE_BRANCH" ;;
@@ -1623,6 +1633,7 @@ update_check() {
       REMOTE_VERSION=""
       return 2 ;;
   esac
+  [ "$quiet" -eq 1 ] || info "Источник: $(access_label "$UPDATE_METHOD"). Версия в репозитории: $REMOTE_VERSION"
   version_gt "$REMOTE_VERSION" "$VERSION"
 }
 
