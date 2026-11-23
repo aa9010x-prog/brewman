@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.6.4"
+VERSION="1.7.0"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -65,7 +65,7 @@ I_PTR=$(icon "👉"); I_STOP=$(icon "🛑"); I_LIST=$(icon "📋"); I_PKG=$(icon
 I_ARR=$(icon "➡️"); I_DONE=$(icon "✨"); I_SEARCH=$(icon "🔎"); I_DEL=$(icon "🗑️")
 I_UPD=$(icon "🔄"); I_SVC=$(icon "⚙️"); I_PIN=$(icon "📌"); I_TAP=$(icon "🚰")
 I_SAVE=$(icon "💾"); I_CLEAN=$(icon "🧹"); I_MODE=$(icon "🔀"); I_EXIT=$(icon "🚪")
-I_BACK=$(icon "↩️"); I_LOCK=$(icon "🔒")
+I_BACK=$(icon "↩️"); I_LOCK=$(icon "🔒"); I_LINK=$(icon "🔗")
 
 # === Глобальное состояние ===
 USE_FZF=0; IS_MAC=0; DIRTY=1; GREEDY=0; INDEX_UPDATED=0; INDEX_STALE=0; BREW_INTERRUPTED=0
@@ -1490,6 +1490,202 @@ maint_menu() {
 }
 
 # ══════════════════════════════════════════════════
+#  14. Приложения, установленные не через Homebrew (передача под управление – adopt)
+# ══════════════════════════════════════════════════
+APP_DIRS="${BREWMAN_APP_DIRS:-/Applications $HOME/Applications}"
+CASK_MAP="$DATA_DIR/cask_apps.tsv"
+CASK_JSON_URL="https://formulae.brew.sh/api/cask.json"
+ADOPT_PATH=(); ADOPT_MATCH=()
+
+file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+
+# Скрипт для встроенного в macOS JavaScript: из справочника cask (JSON) делает строки
+# «имя_cask<TAB>Приложение.app<TAB>версия<TAB>устарел(0/1)»
+write_cask_map_js() {
+  cat > "$1" <<'JS_BREWMAN_END'
+function brewmanAppMap(data) {
+  var out = [], i, j, k;
+  if (data && typeof data.payload === "string") { data = JSON.parse(data.payload); }
+  if (data && !Array.isArray(data)) {
+    var arr = [];
+    for (var key in data) { if (data[key] && typeof data[key] === "object") { if (!data[key].token) { data[key].token = key; } arr.push(data[key]); } }
+    data = arr;
+  }
+  for (i = 0; i < data.length; i++) {
+    var c = data[i];
+    if (!c || c.disabled || !c.token) { continue; }
+    var arts = c.artifacts || [];
+    for (j = 0; j < arts.length; j++) {
+      var a = arts[j];
+      if (!a || !a.app) { continue; }
+      var name = null;
+      for (k = 0; k < a.app.length; k++) {
+        var x = a.app[k];
+        if (typeof x === "string") { if (name === null) { name = x; } }
+        else if (x && x.target) { name = x.target; }
+      }
+      if (!name) { continue; }
+      name = String(name).replace(/^.*\//, "");
+      out.push([c.token, name, String(c.version || "-"), c.deprecated ? "1" : "0"].join("\t"));
+    }
+  }
+  return out.join("\n");
+}
+function run(argv) {
+  ObjC.import("Foundation");
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, $());
+  if (!s || !s.js) { return ""; }
+  return brewmanAppMap(JSON.parse(s.js));
+}
+JS_BREWMAN_END
+}
+
+# Справочник «приложение ➡️ cask»: обновляется не чаще раза в сутки
+load_cask_map() {
+  local age=999999 now t js src tmp local_api
+  now=$(date +%s)
+  t=$(file_mtime "$CASK_MAP")
+  case "$t" in ''|*[!0-9]*) ;; *) age=$((now - t)) ;; esac
+  [ -s "$CASK_MAP" ] && [ "$age" -lt 86400 ] && return 0
+
+  mkdir -p "$DATA_DIR"
+  js="$SESSION_DIR/cask_map.js"; write_cask_map_js "$js"
+  tmp="$SESSION_DIR/cask.json"
+  echo "${I_WAIT}Загружаю справочник приложений Homebrew (несколько мегабайт, не чаще раза в сутки)..."
+  if curl -fsSL --compressed --max-time 180 "$CASK_JSON_URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    src="$tmp"
+  else
+    # Запасной вариант – сохранённый Homebrew кэш справочника
+    local_api="$(brew --cache 2>/dev/null)/api/cask.jws.json"
+    if [ -s "$local_api" ]; then
+      warn "Не удалось скачать справочник – использую сохранённую Homebrew копию."
+      src="$local_api"
+    elif [ -s "$CASK_MAP" ]; then
+      warn "Не удалось скачать справочник – использую прошлую копию."
+      return 0
+    else
+      err "Не удалось скачать справочник приложений: нет доступа к formulae.brew.sh."
+      return 1
+    fi
+  fi
+  echo "${I_WAIT}Разбираю справочник..."
+  if osascript -l JavaScript "$js" "$src" > "$CASK_MAP.tmp" 2>/dev/null && [ -s "$CASK_MAP.tmp" ]; then
+    mv -f "$CASK_MAP.tmp" "$CASK_MAP"
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$CASK_MAP.tmp" "$tmp"
+  [ -s "$CASK_MAP" ] && { warn "Не удалось разобрать справочник – использую прошлую копию."; return 0; }
+  err "Не удалось разобрать справочник приложений."
+  return 1
+}
+
+app_version() {
+  local v
+  v=$(defaults read "$1/Contents/Info" CFBundleShortVersionString 2>/dev/null)
+  [ -n "$v" ] || v=$(defaults read "$1/Contents/Info" CFBundleVersion 2>/dev/null)
+  printf '%s' "$v"
+}
+
+# Поиск приложений, у которых есть cask, но которые установлены не через Homebrew.
+# Результат: LIST (cask), LIST_DESC, TYPES, ADOPT_PATH (путь), ADOPT_MATCH (1 – версия совпадает)
+load_adoptable() {
+  local d app base installed best best_ver best_score score cver aver status n_mas=0 n_managed=0 n_none=0 t v dep
+  reset_lists; ADOPT_PATH=(); ADOPT_MATCH=()
+  installed=" $(caskroom_list 2>/dev/null | awk '{print $1}' | tr '\n' ' ') "
+  for d in $APP_DIRS; do
+    [ -d "$d" ] || continue
+    while IFS= read -r app; do
+      [ -n "$app" ] || continue
+      base=${app##*/}
+      best=""; best_ver=""; best_score=0
+      # Все cask, которые ставят приложение с таким именем. Выбор: не устаревший,
+      # без «@» (не бета и не особая сборка), с самым коротким именем.
+      while IFS="$(printf '\t')" read -r t _ v dep; do
+        [ -n "$t" ] || continue
+        case "$installed" in *" $t "*) best="__managed__"; break ;; esac
+        score=$(( ${#t} ))
+        [ "$dep" = "1" ] && score=$((score + 1000))
+        case "$t" in *@*) score=$((score + 500)) ;; esac
+        if [ -z "$best" ] || [ "$score" -lt "$best_score" ]; then
+          best="$t"; best_ver="$v"; best_score="$score"
+        fi
+      done < <(awk -F '\t' -v b="$base" '$2 == b' "$CASK_MAP")
+      if [ -z "$best" ]; then n_none=$((n_none + 1)); continue; fi
+      if [ "$best" = "__managed__" ]; then n_managed=$((n_managed + 1)); continue; fi
+      if [ -d "$app/Contents/_MASReceipt" ]; then n_mas=$((n_mas + 1)); continue; fi
+      aver=$(app_version "$app")
+      cver=${best_ver%%,*}
+      if [ "$cver" = "latest" ] || [ "$cver" = "-" ] || [ -z "$cver" ]; then
+        status="в Homebrew версия не указана"; ADOPT_MATCH+=("1")
+      elif [ -n "$aver" ] && [ "$aver" = "$cver" ]; then
+        status="версия совпадает"; ADOPT_MATCH+=("1")
+      else
+        status="в Homebrew – $cver"; ADOPT_MATCH+=("0")
+      fi
+      LIST+=("$best"); TYPES+=("cask"); ADOPT_PATH+=("$app")
+      LIST_DESC+=("$base  установлена ${aver:-?} · $status")
+    done < <(find "$d" -maxdepth 2 -name '*.app' -type d -prune 2>/dev/null | sort)
+  done
+  ADOPT_STATS="уже под управлением Homebrew: $n_managed, из App Store: $n_mas, нет в Homebrew: $n_none"
+}
+
+adopt_menu() {
+  local i n_match=0 failed=() it
+  echo ""
+  section "${I_LINK}Приложения, установленные не через Homebrew"
+  if [ "$IS_MAC" -ne 1 ]; then warn "Доступно только в macOS."; pause; return; fi
+  info "Ищу программы в папках «Программы», для которых в Homebrew есть готовый пакет (cask)."
+  info "Передача под управление (--adopt) оставляет программу и её настройки на месте – Homebrew только начинает её учитывать и обновлять."
+  echo ""
+  load_cask_map || { pause; return; }
+  echo "${I_WAIT}Проверяю установленные программы..."
+  load_adoptable
+  echo ""
+  if [ ${#LIST[@]} -eq 0 ]; then
+    ok "Передавать нечего: все программы, для которых есть пакет Homebrew, уже под его управлением."
+    info "Пропущено – $ADOPT_STATS."
+    pause; return
+  fi
+  for i in "${!ADOPT_MATCH[@]}"; do [ "${ADOPT_MATCH[$i]}" = "1" ] && n_match=$((n_match + 1)); done
+  ok "Можно передать под управление: ${#LIST[@]} (с совпадающей версией: $n_match)."
+  info "Пропущено – $ADOPT_STATS. Программы из App Store обновляет App Store."
+  info "Если версии различаются, Homebrew может отказаться брать программу – тогда brewman предложит заменить её версией из Homebrew."
+  echo ""
+  PICK_PREVIEW="--cask"
+  pick "Передать под управление" 1 || { pause; return; }
+  sel_items
+  echo ""
+  info "Будут переданы под управление Homebrew:"
+  for i in "${SEL_IDX[@]}"; do echo "   • ${LIST[$i]} ${C_D}(${ADOPT_PATH[$i]})${C_0}"; done
+  if ! confirm "Передать ${#ITEMS[@]} шт.?"; then stopped; pause; return; fi
+
+  CASK_EXTRA="--adopt"
+  batch_run install "${ITEMS[@]}"
+  CASK_EXTRA=""
+
+  # Не взятые под управление – предложить замену версией из Homebrew
+  for it in "${ITEMS[@]}"; do
+    brew list --cask --versions "${it#*:}" >/dev/null 2>&1 || failed+=("$it")
+  done
+  if [ ${#failed[@]} -gt 0 ] && [ "$BREW_INTERRUPTED" -ne 1 ]; then
+    echo ""
+    warn "Не удалось передать под управление: ${#failed[@]} шт. Обычно причина – версия программы отличается от версии в Homebrew."
+    info "Можно заменить их версией из Homebrew (--force): программа переустановится, настройки и данные в вашей папке пользователя сохранятся."
+    info "Перед заменой закройте эти программы."
+    show_items "${failed[@]}"
+    if confirm_danger "Заменить версией из Homebrew?"; then
+      CASK_EXTRA="--force"
+      batch_run install "${failed[@]}"
+      CASK_EXTRA=""
+    else
+      stopped
+    fi
+  fi
+  pause
+}
+
+# ══════════════════════════════════════════════════
 #  12. Режим выбора (fzf / номера)
 # ══════════════════════════════════════════════════
 toggle_fzf() {
@@ -2092,6 +2288,7 @@ main_loop() {
     mitem "11) ${I_CLEAN}Обслуживание и очистка"
     mitem "12) ${I_MODE}Режим выбора: fzf или номера"
     mitem "13) ${I_UPD}Обновление brewman"
+    mitem "14) ${I_LINK}Приложения не из Homebrew: передать под управление"
     mitem " 0) ${I_EXIT}Выход"
     echo "$LINE1"
     if ! ask "Пункт меню (0 или Ctrl+C – выход): "; then
@@ -2112,6 +2309,7 @@ main_loop() {
       11) maint_menu ;;
       12) toggle_fzf ;;
       13) selfupdate_menu ;;
+      14) adopt_menu ;;
       0|q|Q|й|Й|exit|выход) quit ;;
       "") ;;
       *) err "Нет такого пункта: $ANSWER"; sleep 1 ;;
