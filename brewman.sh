@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.7.1"
+VERSION="1.7.2"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -933,6 +933,42 @@ stale_warning() {
   warn "Индекс не обновился – список ниже построен по сохранённым данным${d:+ от $d} и может быть неполным."
 }
 
+# Известная проблема Homebrew: brew update догружает файл API «по дате» (curl --time-cond)
+# относительно сохранённой копии, и такая загрузка срывается (curl, код 56), хотя обычная
+# загрузка проходит. Обход – удалить сохранённую копию этого файла и запустить brew update --force.
+# $1 – адрес файла из ошибки. Код 0 – индекс обновлён.
+update_timecond_fix() {
+  local url="$1" cache_file auto=0
+  cache_file="$(brew --cache)/api/${url#*/api/}"
+  [ "$(cat "$DATA_DIR/update_autofix" 2>/dev/null)" = "1" ] && auto=1
+  if [ "$auto" -eq 1 ]; then
+    info "Применяю исправление автоматически (настройка в меню «Обновления»)."
+  else
+    info "Файл на сервере доступен, а brew скачать его не смог. Это известная проблема Homebrew:"
+    info "при обновлении он догружает файл «по дате» относительно сохранённой копии, и такая загрузка срывается."
+    info "Обход – удалить сохранённую копию только этого файла и обновить принудительно (brew update --force). Это безопасно: файл скачается заново."
+    confirm "Применить исправление?" || return 1
+  fi
+  rm -f "$cache_file" && ok "Сохранённая копия удалена: $cache_file"
+  if run_brew update --force; then
+    if [ "$auto" -eq 0 ]; then
+      info "Проблема, скорее всего, будет повторяться: после обновления снова появляется сохранённая копия."
+      if confirm "В следующий раз исправлять автоматически, без вопросов?"; then
+        mkdir -p "$DATA_DIR" && echo 1 > "$DATA_DIR/update_autofix" && ok "Автоисправление включено. Выключить – меню «Обновления»."
+      fi
+    fi
+    return 0
+  fi
+  [ "$BREW_INTERRUPTED" -eq 1 ] && return 1
+  warn "Не помогло."
+  if confirm "Очистить весь кэш данных Homebrew ($(brew --cache)/api) и повторить?"; then
+    rm -rf "$(brew --cache)/api" && ok "Кэш очищен."
+    run_brew update --force && return 0
+  fi
+  warn "Вероятно, сбой на стороне Homebrew или в сети – повторите позже."
+  return 1
+}
+
 # Разбор ошибки brew update: проверка сервера, очистка кэша, повтор.
 # Код 0 – индекс в итоге обновлён.
 diagnose_update_failure() {
@@ -950,13 +986,7 @@ diagnose_update_failure() {
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null)
   case "$code" in
     200)
-      info "Файл на сервере есть и скачивается – скорее всего, повреждён сохранённый кэш данных Homebrew (папка $(brew --cache)/api)."
-      info "Очистка безопасна: кэш просто скачается заново."
-      if confirm "Очистить кэш и повторить brew update?"; then
-        rm -rf "$(brew --cache)/api" && ok "Кэш очищен."
-        run_brew update && return 0
-        warn "Не помогло. Вероятно, сбой на стороне Homebrew – повторите позже."
-      fi ;;
+      update_timecond_fix "$url" && return 0 ;;
     000|"")
       info "Сервер $host недоступен с этого компьютера: нет сети, мешает VPN или прокси, либо сервер не отвечает."
       info "Попробуйте включить или выключить VPN."
@@ -1005,6 +1035,7 @@ updates_menu() {
     mitem "3) Обновить все пакеты"
     mitem "4) Обновить выбранные пакеты"
     [ "$IS_MAC" -eq 1 ] && mitem "5) Учитывать приложения с автообновлением (greedy): $gl"
+    mitem "6) Автоисправление сбоя загрузки при brew update: $( [ "$(cat "$DATA_DIR/update_autofix" 2>/dev/null)" = "1" ] && echo "вкл" || echo "выкл")"
     mitem "0) ${I_BACK}Назад"
     echo "$LINE1"
     ask "Пункт: " || return
@@ -1051,6 +1082,14 @@ updates_menu() {
             CASK_EXTRA=""
           fi
         fi ;;
+      6)
+        mkdir -p "$DATA_DIR"
+        if [ "$(cat "$DATA_DIR/update_autofix" 2>/dev/null)" = "1" ]; then
+          rm -f "$DATA_DIR/update_autofix"; ok "Автоисправление выключено: при сбое brewman будет спрашивать."
+        else
+          echo 1 > "$DATA_DIR/update_autofix"; ok "Автоисправление включено."
+        fi
+        info "Речь об известной проблеме Homebrew: «Failed to download …jws.json» при доступном сервере. Исправление – удалить сохранённую копию файла и запустить brew update --force." ;;
       5)
         if [ "$IS_MAC" -eq 1 ]; then
           if [ "$GREEDY" -eq 1 ]; then GREEDY=0; else GREEDY=1; fi
