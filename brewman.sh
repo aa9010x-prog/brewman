@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -2013,24 +2013,70 @@ access_label() {
   esac
 }
 
-# Скачать файл из репозитория в stdout. $1 – путь к файлу в репозитории.
-remote_get() {
-  local path="$1" tok
-  case "$UPDATE_METHOD" in
-    public)
-      curl -fsSL --max-time 60 -H "Accept: application/vnd.github.raw" "$(api_url "$path")" ;;
-    raw)
-      curl -fsSL --max-time 60 "$(raw_url "$path")" ;;
-    gh)
-      gh api -H "Accept: application/vnd.github.raw" "repos/$UPDATE_REPO/contents/$path?ref=$UPDATE_BRANCH" ;;
-    token)
-      tok=$(update_token) || return 1
-      # Токен передаётся через stdin, чтобы не светиться в списке процессов
-      printf 'header = "Authorization: Bearer %s"\n' "$tok" |
-        curl -fsSL --max-time 60 -K - -H "Accept: application/vnd.github.raw" \
-          "https://api.github.com/repos/$UPDATE_REPO/contents/$path?ref=$UPDATE_BRANCH" ;;
-    *) return 1 ;;
+# Расшифровка результата попытки загрузки
+fetch_code_text() {
+  case "$1" in
+    000|"") echo "нет соединения (сеть, VPN или блокировка)" ;;
+    403|429) echo "GitHub ограничил запросы (код $1; без входа – 60 запросов в час на адрес, через VPN лимит быстро кончается)" ;;
+    404) echo "файл не найден (код 404; репозиторий приватный или файла нет)" ;;
+    gh) echo "команда gh завершилась с ошибкой" ;;
+    *) echo "ответ сервера $1" ;;
   esac
+}
+
+fetch_method_name() {
+  case "$1" in
+    public) echo "API GitHub" ;;
+    raw) echo "raw.githubusercontent.com" ;;
+    gh) echo "gh" ;;
+    token) echo "токен" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Скачать файл репозитория. $1 – путь в репозитории, $2 – куда сохранить.
+# Пробует по очереди: последний удачный способ, API GitHub, raw.githubusercontent.com, gh, токен.
+# При успехе запоминает способ в UPDATE_METHOD; при неудаче причины – в REMOTE_ERR.
+remote_get() {
+  local path="$1" out="$2" m tried=" " code tok max=20
+  [ "$path" = "brewman.sh" ] && max=90
+  REMOTE_ERR=""
+  for m in $UPDATE_METHOD public raw gh token; do
+    case "$tried" in *" $m "*) continue ;; esac
+    tried="$tried$m "
+    code=""
+    case "$m" in
+      public)
+        command -v curl >/dev/null 2>&1 || continue
+        code=$(curl -sS -L --max-time "$max" -o "$out" -w '%{http_code}' \
+          -H "Accept: application/vnd.github.raw" "$(api_url "$path")" 2>/dev/null) ;;
+      raw)
+        command -v curl >/dev/null 2>&1 || continue
+        code=$(curl -sS -L --max-time "$max" -o "$out" -w '%{http_code}' "$(raw_url "$path")" 2>/dev/null) ;;
+      gh)
+        command -v gh >/dev/null 2>&1 || continue
+        if with_timeout "$max" gh api -H "Accept: application/vnd.github.raw" \
+             "repos/$UPDATE_REPO/contents/$path?ref=$UPDATE_BRANCH" > "$out" 2>/dev/null; then
+          code=200
+        else
+          code=gh
+        fi ;;
+      token)
+        tok=$(update_token) || continue
+        # Токен передаётся через stdin, чтобы не светиться в списке процессов
+        code=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" |
+          curl -sS -L --max-time "$max" -K - -o "$out" -w '%{http_code}' \
+            -H "Accept: application/vnd.github.raw" "$(api_url "$path")" 2>/dev/null) ;;
+      *) continue ;;
+    esac
+    if [ "$code" = "200" ] && [ -s "$out" ]; then
+      UPDATE_METHOD="$m"
+      return 0
+    fi
+    REMOTE_ERR="${REMOTE_ERR}   • $(fetch_method_name "$m"): $(fetch_code_text "$code")
+"
+  done
+  return 1
 }
 
 # Проверка новой версии. $1=1 – тихий режим. Результат в REMOTE_VERSION.
@@ -2040,15 +2086,14 @@ update_check() {
   REMOTE_VERSION=""
   mkdir -p "$DATA_DIR" 2>/dev/null
   date +%s > "$DATA_DIR/last_check" 2>/dev/null
-  UPDATE_METHOD=$(update_access)
-  if [ "$UPDATE_METHOD" = "none" ]; then
-    [ "$quiet" -eq 1 ] || warn "Нет доступа к $UPDATE_REPO: нет сети, репозиторий ещё не опубликован или он приватный (тогда настройте доступ – пункт 13 ➡️ 6)."
-    return 2
-  fi
   tmp=$(mktemp "${TMPDIR:-/tmp}/brewman.XXXXXX")
-  if ! with_timeout 20 remote_get VERSION > "$tmp" 2>/dev/null; then
+  if ! remote_get VERSION "$tmp"; then
     rm -f "$tmp"
-    [ "$quiet" -eq 1 ] || err "Не удалось получить версию из $UPDATE_REPO (нет сети или доступа к репозиторию)."
+    if [ "$quiet" -eq 0 ]; then
+      err "Не удалось получить версию из $UPDATE_REPO. Что ответил каждый способ:"
+      printf '%s' "$REMOTE_ERR"
+      info "Если GitHub ограничил запросы – подождите до часа или войдите через gh (пункт 6). Если репозиторий приватный – тоже пункт 6."
+    fi
     return 2
   fi
   REMOTE_VERSION=$(tr -d '[:space:]' < "$tmp")
@@ -2066,7 +2111,8 @@ update_check() {
 # Изменения новее версии $1 из журнала CHANGELOG.md репозитория
 show_changes() {
   local since="$1" log
-  log=$(with_timeout 20 remote_get CHANGELOG.md 2>/dev/null) || return 0
+  remote_get CHANGELOG.md "$SESSION_DIR/changelog" || return 0
+  log=$(cat "$SESSION_DIR/changelog")
   [ -n "$log" ] || return 0
   printf '%s\n' "$log" | awk -v cur="$since" '
     function gt(a, b,   x, y, n, m, k, i) {
@@ -2084,9 +2130,9 @@ update_apply() {
   tmpd=$(mktemp -d "${TMPDIR:-/tmp}/brewman.XXXXXX")
 
   step "Шаг 1: загрузка brewman $REMOTE_VERSION"
-  if ! with_timeout 60 remote_get brewman.sh > "$tmpd/brewman" 2> "$tmpd/err"; then
-    err "Не удалось скачать файл."
-    sed 's/^/   /' "$tmpd/err"
+  if ! remote_get brewman.sh "$tmpd/brewman"; then
+    err "Не удалось скачать файл. Что ответил каждый способ:"
+    printf '%s' "$REMOTE_ERR"
     rm -rf "$tmpd"
     return 1
   fi
@@ -2174,6 +2220,7 @@ update_access_setup() {
   echo ""
   case "$ANSWER" in
     1)
+      m="gh"
       if ! command -v gh >/dev/null 2>&1; then
         warn "Утилита gh не установлена."
         if confirm "Установить gh через Homebrew?"; then
@@ -2190,6 +2237,7 @@ update_access_setup() {
         gh auth login || { err "Вход не выполнен."; return 1; }
       fi ;;
     2)
+      m="token"
       info "Создайте токен: https://github.com/settings/personal-access-tokens/new"
       echo "   • Repository access: Only select repositories ➡️ brewman"
       echo "   • Permissions ➡️ Repository permissions ➡️ Contents: Read-only"
@@ -2207,13 +2255,13 @@ update_access_setup() {
   esac
   echo ""
   echo "${I_WAIT}Проверяю доступ к $UPDATE_REPO..."
-  m=$(update_access)
   UPDATE_METHOD="$m"
-  if [ "$m" != "none" ] && with_timeout 20 remote_get VERSION >/dev/null 2>&1; then
-    ok "Доступ есть ($(access_label "$m"))."
+  if remote_get VERSION "$SESSION_DIR/version_probe"; then
+    ok "Доступ есть ($(access_label "$UPDATE_METHOD"))."
     return 0
   fi
-  err "Доступа к $UPDATE_REPO нет. Проверьте аккаунт gh или права токена."
+  err "Доступа к $UPDATE_REPO нет:"
+  printf '%s' "$REMOTE_ERR"
   return 1
 }
 
@@ -2287,7 +2335,7 @@ selfupdate_menu() {
               update_apply 1
             fi ;;
           1) ok "Установлена последняя версия ($VERSION)." ;;
-          *) [ "$UPDATE_METHOD" = "none" ] && confirm "Настроить доступ сейчас?" && update_access_setup ;;
+          *) ;;
         esac ;;
       3)
         if update_rollback; then
@@ -2297,12 +2345,11 @@ selfupdate_menu() {
           exec bash "$INSTALL_DIR/$APP_NAME"
         fi ;;
       4)
-        UPDATE_METHOD=$(update_access)
-        if [ "$UPDATE_METHOD" = "none" ]; then
-          warn "Нет доступа к репозиторию: нет сети или он приватный (тогда – пункт 6)."
+        if ! remote_get CHANGELOG.md "$SESSION_DIR/changelog"; then
+          err "Не удалось загрузить журнал:"
+          printf '%s' "$REMOTE_ERR"
         else
-          echo "${I_WAIT}Загружаю журнал..."
-          with_timeout 20 remote_get CHANGELOG.md 2>/dev/null | sed 's/^/   /' || err "Не удалось загрузить журнал."
+          sed 's/^/   /' "$SESSION_DIR/changelog"
         fi ;;
       5)
         mkdir -p "$DATA_DIR"
@@ -2334,7 +2381,7 @@ cli_update() {
       if confirm "Обновить?"; then update_apply 0 || return 1; else stopped; fi ;;
     1) ok "Установлена последняя версия ($VERSION)." ;;
     *)
-      if [ "$UPDATE_METHOD" = "none" ] && confirm "Настроить доступ к GitHub сейчас?"; then
+      if confirm "Настроить доступ к GitHub через gh или токен?"; then
         update_access_setup && cli_update
         return $?
       fi
