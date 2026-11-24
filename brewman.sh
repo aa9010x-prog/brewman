@@ -11,7 +11,7 @@
 #  Справка:            brewman --help
 # ══════════════════════════════════════════════════
 
-VERSION="1.7.2"
+VERSION="1.8.0"
 APP_NAME="brewman"
 INSTALL_DIR="$HOME/.local/bin"
 DATA_DIR="$HOME/.local/share/brewman"
@@ -464,19 +464,19 @@ parse_outdated() {
 }
 
 load_outdated() {
-  reset_lists
+  reset_lists; OUT_CUR=(); OUT_NEW=()
   local name cur new rest gflag=""
   [ "$GREEDY" -eq 1 ] && gflag="--greedy"
   while IFS='|' read -r name cur new rest; do
     [ -z "$name" ] && continue
     rest=${rest/pinned at/закреплена на}
-    LIST+=("$name"); TYPES+=("formula")
+    LIST+=("$name"); TYPES+=("formula"); OUT_CUR+=("$cur"); OUT_NEW+=("$new")
     LIST_DESC+=("$cur ${I_ARR}$new  формула$rest")
   done < <(bq outdated --formula --verbose | parse_outdated)
   if [ "$IS_MAC" -eq 1 ]; then
     while IFS='|' read -r name cur new rest; do
       [ -z "$name" ] && continue
-      LIST+=("$name"); TYPES+=("cask")
+      LIST+=("$name"); TYPES+=("cask"); OUT_CUR+=("$cur"); OUT_NEW+=("$new")
       LIST_DESC+=("$cur ${I_ARR}$new  приложение$rest")
     done < <(bq outdated --cask --verbose $gflag | parse_outdated)
   fi
@@ -484,7 +484,7 @@ load_outdated() {
   if [ ${#LIST[@]} -eq 0 ]; then
     while read -r name; do
       [ -z "$name" ] && continue
-      LIST+=("$name"); TYPES+=(""); LIST_DESC+=("")
+      LIST+=("$name"); TYPES+=(""); LIST_DESC+=(""); OUT_CUR+=(""); OUT_NEW+=("")
     done < <(bq outdated --quiet $gflag 2>/dev/null)
   fi
 }
@@ -1024,6 +1024,160 @@ maybe_update_index() {
   confirm "Сначала обновить индекс (brew update)?" && update_index
 }
 
+# ══════════════════════════════════════════════════
+#  «Что нового»: заметки к выпускам для доступных обновлений
+# ══════════════════════════════════════════════════
+NOTES_FLAG="$DATA_DIR/release_notes"
+GH_STATE=""   # ok | no – авторизован ли gh (проверяется один раз за сеанс)
+
+notes_enabled() { [ "$(cat "$NOTES_FLAG" 2>/dev/null)" = "1" ]; }
+
+# Запуск JavaScript: встроенный в macOS (osascript) или node. $1 – скрипт, далее аргументы.
+js_exec() {
+  local js="$1"; shift
+  if [ "$IS_MAC" -eq 1 ] && command -v osascript >/dev/null 2>&1; then
+    osascript -l JavaScript "$js" "$@"
+  elif command -v node >/dev/null 2>&1; then
+    node "$js" "$@"
+  else
+    return 127
+  fi
+}
+
+# Отбор выпусков между установленной и новой версией. Аргументы: файл JSON, текущая, новая, строк на выпуск.
+write_notes_js() {
+  cat > "$1" <<'JS_NOTES_END'
+function brewmanNotes(rel, cur, nw, maxLines) {
+  function norm(t) { t = String(t || "").replace(/_/g, "."); var m = t.match(/(\d+(?:\.\d+)*)/); return m ? m[1] : null; }
+  function cmp(a, b) {
+    var x = a.split("."), y = b.split("."), i, p, q;
+    for (i = 0; i < Math.max(x.length, y.length); i++) { p = +(x[i] || 0); q = +(y[i] || 0); if (p !== q) { return p < q ? -1 : 1; } }
+    return 0;
+  }
+  function date(s) { var m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? m[3] + "." + m[2] + "." + m[1] : ""; }
+  if (!Array.isArray(rel) || !rel.length) { return ""; }
+  var c = norm(cur), n = norm(nw), picked = [], out = [], i, j;
+  for (i = 0; i < rel.length; i++) {
+    var r = rel[i], v;
+    if (!r || r.draft) { continue; }
+    v = norm(r.tag_name) || norm(r.name);
+    if (v && c && n && cmp(v, c) > 0 && cmp(v, n) <= 0) { picked.push(r); }
+  }
+  if (!picked.length) {
+    for (i = 0; i < rel.length; i++) { if (rel[i] && !rel[i].draft && !rel[i].prerelease) { picked.push(rel[i]); break; } }
+    if (picked.length) { out.push("(версии выпусков на GitHub не совпали с версиями пакета – показан последний выпуск)"); }
+  }
+  var shown = picked.slice(0, 5);
+  for (i = 0; i < shown.length; i++) {
+    var p = shown[i], title = p.name || p.tag_name, d = date(p.published_at);
+    out.push("■ " + title + (d ? " – " + d : ""));
+    var body = String(p.body || "").replace(/\r/g, "").replace(/<!--[\s\S]*?-->/g, "").split("\n");
+    var lines = [];
+    for (j = 0; j < body.length; j++) { if (body[j].replace(/\s+/g, "") !== "" || (lines.length && lines[lines.length - 1] !== "")) { lines.push(body[j]); } }
+    while (lines.length && lines[lines.length - 1] === "") { lines.pop(); }
+    if (!lines.length) { out.push("  (описание не заполнено)"); }
+    for (j = 0; j < lines.length && j < maxLines; j++) { out.push("  " + lines[j]); }
+    if (lines.length > maxLines) { out.push("  … полностью: " + p.html_url); }
+    out.push("");
+  }
+  if (picked.length > shown.length) { out.push("Ещё выпусков: " + (picked.length - shown.length) + " – все на GitHub."); }
+  return out.join("\n");
+}
+function run(argv) {
+  ObjC.import("Foundation");
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, $());
+  if (!s || !s.js) { return ""; }
+  return brewmanNotes(JSON.parse(s.js), argv[1], argv[2], +argv[3]);
+}
+if (typeof process !== "undefined" && process.argv && typeof require === "function") {
+  var a = process.argv.slice(2);
+  process.stdout.write(brewmanNotes(JSON.parse(require("fs").readFileSync(a[0], "utf8")), a[1], a[2], +a[3]) + "\n");
+}
+JS_NOTES_END
+}
+
+# Репозиторий GitHub пакета (владелец/проект) по данным brew info; пусто, если не на GitHub
+pkg_github_repo() {
+  local flag=""
+  case "$2" in formula) flag="--formula" ;; cask) flag="--cask" ;; esac
+  brew info --json=v2 $flag "$1" 2>/dev/null \
+    | grep -o 'https://github\.com/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*' \
+    | grep -v -i -E 'github\.com/(Homebrew|user-attachments|orgs|sponsors|apps|settings)/' \
+    | head -1 | sed -E 's#https://github\.com/##; s#\.git$##'
+}
+
+pkg_homepage() {
+  local flag=""
+  case "$2" in formula) flag="--formula" ;; cask) flag="--cask" ;; esac
+  brew info --json=v2 $flag "$1" 2>/dev/null | grep -o '"homepage": *"[^"]*"' | head -1 | sed 's/^"homepage": *"//; s/"$//'
+}
+
+# Выпуски проекта с GitHub в файл $2. Возвращает HTTP-код в RELEASES_CODE.
+fetch_releases() {
+  local repo="$1" out="$2"
+  RELEASES_CODE=""
+  if [ -z "$GH_STATE" ]; then
+    if command -v gh >/dev/null 2>&1 && with_timeout 10 gh auth status >/dev/null 2>&1; then GH_STATE="ok"; else GH_STATE="no"; fi
+  fi
+  if [ "$GH_STATE" = "ok" ]; then
+    if with_timeout 30 gh api "repos/$repo/releases?per_page=40" > "$out" 2>/dev/null; then RELEASES_CODE=200; return 0; fi
+  fi
+  RELEASES_CODE=$(curl -sS -o "$out" -w '%{http_code}' --max-time 30 \
+    -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$repo/releases?per_page=40" 2>/dev/null)
+}
+
+# Заметки к выпускам для пакетов с индексами из LIST (после load_outdated)
+release_notes_body() {
+  local i name kind repo hp tmp notes js="$SESSION_DIR/notes.js" limited=0
+  write_notes_js "$js"
+  tmp="$SESSION_DIR/releases.json"
+  for i in "$@"; do
+    name="${LIST[$i]}"; kind="${TYPES[$i]}"
+    echo "▼─── $name: ${OUT_CUR[$i]:-?} ${I_ARR}${OUT_NEW[$i]:-?} ───▼"
+    repo=$(pkg_github_repo "$name" "$kind")
+    if [ -z "$repo" ]; then
+      hp=$(pkg_homepage "$name" "$kind")
+      info "Программа не на GitHub – что нового, смотрите на сайте: ${hp:-адрес неизвестен}"
+    elif [ "$limited" -eq 1 ]; then
+      info "Заметки: https://github.com/$repo/releases"
+    else
+      fetch_releases "$repo" "$tmp"
+      case "$RELEASES_CODE" in
+        200)
+          notes=$(js_exec "$js" "$tmp" "${OUT_CUR[$i]}" "${OUT_NEW[$i]}" 30 2>/dev/null)
+          if [ -n "$notes" ]; then
+            printf '%s\n' "$notes"
+          else
+            info "Заметок к выпускам нет: https://github.com/$repo/releases"
+          fi ;;
+        403|429)
+          limited=1
+          warn "GitHub временно ограничил запросы (без входа – 60 в час). Чтобы снять ограничение, войдите через gh: brew install gh, затем gh auth login."
+          info "Заметки: https://github.com/$repo/releases" ;;
+        404) info "У проекта нет выпусков на GitHub: https://github.com/$repo" ;;
+        *) warn "Не удалось получить заметки (нет сети или ответ ${RELEASES_CODE:-пустой}). Ссылка: https://github.com/$repo/releases" ;;
+      esac
+    fi
+    echo "▲────────────────────────▲"
+    echo ""
+  done
+  rm -f "$tmp"
+}
+
+# Показ заметок: длинный вывод – через постраничный просмотр
+show_release_notes() {
+  [ "$#" -gt 0 ] || return 0
+  echo ""
+  section "${I_INFO}Что нового в обновлениях"
+  echo "${I_WAIT}Собираю заметки к выпускам (${#} шт.)..."
+  if [ -t 1 ] && command -v less >/dev/null 2>&1; then
+    info "Листать – стрелки и пробел, закрыть – q."
+    release_notes_body "$@" | less -FRX
+  else
+    release_notes_body "$@"
+  fi
+}
+
 updates_menu() {
   local gl
   while true; do
@@ -1036,6 +1190,8 @@ updates_menu() {
     mitem "4) Обновить выбранные пакеты"
     [ "$IS_MAC" -eq 1 ] && mitem "5) Учитывать приложения с автообновлением (greedy): $gl"
     mitem "6) Автоисправление сбоя загрузки при brew update: $( [ "$(cat "$DATA_DIR/update_autofix" 2>/dev/null)" = "1" ] && echo "вкл" || echo "выкл")"
+    mitem "7) Что нового в доступных обновлениях"
+    mitem "8) Показывать «что нового» перед обновлением: $(notes_enabled && echo "вкл" || echo "выкл")"
     mitem "0) ${I_BACK}Назад"
     echo "$LINE1"
     ask "Пункт: " || return
@@ -1057,6 +1213,7 @@ updates_menu() {
           ok "Все пакеты актуальны."
         else
           print_list
+          notes_enabled && show_release_notes "${!LIST[@]}"
           echo ""
           if confirm "Обновить все пакеты (${#LIST[@]} шт.)?"; then
             if [ "$GREEDY" -eq 1 ]; then run_brew upgrade --greedy; else run_brew upgrade; fi
@@ -1077,10 +1234,31 @@ updates_menu() {
           PICK_PREVIEW=""
           if pick "Обновить" 1; then
             sel_items
+            notes_enabled && show_release_notes "${SEL_IDX[@]}"
             [ "$GREEDY" -eq 1 ] && CASK_EXTRA="--greedy"
             if confirm "Обновить ${#ITEMS[@]} шт.?"; then batch_run upgrade "${ITEMS[@]}"; else stopped; fi
             CASK_EXTRA=""
           fi
+        fi ;;
+      7)
+        maybe_update_index
+        echo "${I_WAIT}Проверяю устаревшие пакеты..."
+        load_outdated
+        stale_warning
+        if [ ${#LIST[@]} -eq 0 ]; then
+          ok "Все пакеты актуальны – смотреть нечего."
+        else
+          PICK_PREVIEW=""
+          info "Выберите пакеты или введите «все»."
+          pick "Что нового" 1 && show_release_notes "${SEL_IDX[@]}"
+        fi ;;
+      8)
+        mkdir -p "$DATA_DIR"
+        if notes_enabled; then
+          rm -f "$NOTES_FLAG"; ok "Показ «что нового» перед обновлением выключен. Посмотреть вручную – пункт 7."
+        else
+          echo 1 > "$NOTES_FLAG"; ok "Включено: перед «Обновить все» и «Обновить выбранные» будут показаны заметки к выпускам."
+          info "Заметки берутся с GitHub; для программ не с GitHub показывается ссылка на сайт."
         fi ;;
       6)
         mkdir -p "$DATA_DIR"
@@ -1535,6 +1713,7 @@ APP_DIRS="${BREWMAN_APP_DIRS:-/Applications $HOME/Applications}"
 CASK_MAP="$DATA_DIR/cask_apps.tsv"
 CASK_JSON_URL="https://formulae.brew.sh/api/cask.json"
 ADOPT_PATH=(); ADOPT_MATCH=()
+OUT_CUR=(); OUT_NEW=()
 
 file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
 
